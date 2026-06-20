@@ -23,6 +23,12 @@ import java.util.Locale;
  * - GPS_ONLY: use Android Location speed directly.
  * - FUSION: use acceleration for fast response and GPS as the absolute anchor.
  *
+ * V11 adds a stop-detection state machine. Pure accelerometer integration can drift,
+ * so braking impulse + near-zero acceleration are used to infer "vehicle has stopped".
+ * In FUSION mode, GPS is treated as a slow anchor and low-speed confirmation only;
+ * delayed non-zero GPS readings are not allowed to immediately wake the sound after
+ * the accelerometer has confidently detected a stop.
+ *
  * The provider deliberately sends an already-smoothed target speed to VvvfSynthEngine;
  * the original audio-engine smoothing is still kept and remains the final anti-stutter layer.
  */
@@ -32,6 +38,15 @@ public class PhoneSensorDataProvider implements SensorEventListener, LocationLis
         ACCEL_ONLY,
         GPS_ONLY,
         FUSION
+    }
+
+    private enum MotionState {
+        STOPPED,
+        ACCELERATING,
+        CRUISING,
+        BRAKING,
+        STOP_CANDIDATE,
+        STOP_CONFIRMED
     }
 
     public interface Listener {
@@ -59,6 +74,17 @@ public class PhoneSensorDataProvider implements SensorEventListener, LocationLis
             this.rawSummary = rawSummary;
         }
     }
+
+    private static final double MAX_SPEED_MPS = 72.222; // 260km/h
+    private static final double ACCEL_DEADBAND_MPS2 = 0.045;
+    private static final double START_ACCEL_MPS2 = 0.16;
+    private static final double BRAKE_ACCEL_MPS2 = -0.14;
+    private static final double STRONG_BRAKE_MPS2 = -0.24;
+    private static final double CRUISE_ACCEL_MPS2 = 0.10;
+    private static final long STOP_STABLE_MIN_NS = 650_000_000L;
+    private static final long STOP_CONFIRM_MIN_NS = 1_050_000_000L;
+    private static final long GPS_FRESH_NS = 2_500_000_000L;
+    private static final long GPS_DELAY_HOLD_AFTER_STOP_NS = 3_500_000_000L;
 
     private final Context context;
     private final Listener listener;
@@ -93,6 +119,18 @@ public class PhoneSensorDataProvider implements SensorEventListener, LocationLis
     private long sampleCount = 0L;
     private boolean hasGpsSpeed = false;
     private boolean hasLocationPermission = false;
+
+    private MotionState motionState = MotionState.STOPPED;
+    private long motionStateSinceNs = 0L;
+    private long nearZeroSinceNs = 0L;
+    private long brakeStableSinceNs = 0L;
+    private long lastStopConfirmedNs = 0L;
+    private long gpsMovingSinceNs = 0L;
+    private double driveImpulseMps = 0.0;
+    private double brakeImpulseMps = 0.0;
+    private double speedAtBrakeStartMps = 0.0;
+    private double maxSpeedDuringRunMps = 0.0;
+    private double lastLongitudinalAccelMps2 = 0.0;
 
     public PhoneSensorDataProvider(Context context, Listener listener) {
         this.context = context.getApplicationContext();
@@ -141,7 +179,8 @@ public class PhoneSensorDataProvider implements SensorEventListener, LocationLis
         lastReportedSpeedKmh = speedMps * 3.6;
         gravity[0] = gravity[1] = gravity[2] = 0f;
         linear[0] = linear[1] = linear[2] = 0f;
-        setStatus("加速度零点/轴向已重置");
+        resetMotionState(SystemClock.elapsedRealtimeNanos(), speedMps <= 0.30 ? MotionState.STOPPED : MotionState.CRUISING);
+        setStatus("加速度零点/轴向/停车状态已重置");
     }
 
     public String getStatusText() {
@@ -150,9 +189,9 @@ public class PhoneSensorDataProvider implements SensorEventListener, LocationLis
         if (axisIndex < 0) axis = "axis=auto";
         else axis = String.format(Locale.US, "axis=%c%s%s", (char)('X' + axisIndex), axisSign > 0 ? "+" : "-", axisLocked ? "" : "? 非锁定");
         String gps = gpsAgeMs >= 0 ? String.format(Locale.US, "GPS=%.1fkm/h %dms", gpsSpeedMps * 3.6, gpsAgeMs) : "GPS=--";
-        return String.format(Locale.US, "%s | mode=%s | %.1fkm/h | %s | %s | invert=%s | %s",
-                statusText, mode.name(), lastReportedSpeedKmh, gps, axis, accelDirectionInverted ? "ON" : "OFF",
-                usingLinearAcceleration ? "linear" : "accel-gravity");
+        return String.format(Locale.US, "%s | mode=%s | %.1fkm/h | %s | %s | state=%s | brake=%.2fm/s | invert=%s | %s",
+                statusText, mode.name(), lastReportedSpeedKmh, gps, axis, motionState.name(), brakeImpulseMps,
+                accelDirectionInverted ? "ON" : "OFF", usingLinearAcceleration ? "linear" : "accel-gravity");
     }
 
     public void start() {
@@ -175,6 +214,8 @@ public class PhoneSensorDataProvider implements SensorEventListener, LocationLis
             return;
         }
 
+        long nowNs = SystemClock.elapsedRealtimeNanos();
+        if (motionStateSinceNs == 0L) resetMotionState(nowNs, speedMps <= 0.30 ? MotionState.STOPPED : MotionState.CRUISING);
         if (needsAcceleration(mode)) registerAcceleration();
         if (needsGps(mode)) registerLocation();
         setStatus("Phone sensor mode=" + mode.name());
@@ -280,7 +321,8 @@ public class PhoneSensorDataProvider implements SensorEventListener, LocationLis
 
         updateAxisAutoLock(nowNs);
         double longitudinalAccel = getLongitudinalAccel();
-        if (Math.abs(longitudinalAccel) < 0.045) longitudinalAccel = 0.0;
+        if (Math.abs(longitudinalAccel) < ACCEL_DEADBAND_MPS2) longitudinalAccel = 0.0;
+        lastLongitudinalAccelMps2 = longitudinalAccel;
 
         integrateAcceleration(longitudinalAccel, dt, nowNs);
         reportIfNeeded(nowNs, (float) longitudinalAccel, false);
@@ -338,7 +380,7 @@ public class PhoneSensorDataProvider implements SensorEventListener, LocationLis
 
     private void maybeLearnDirectionFromGps(double accelAfterSign) {
         long nowNs = SystemClock.elapsedRealtimeNanos();
-        if (lastGpsNs == 0L || nowNs - lastGpsNs > 2_500_000_000L) return;
+        if (lastGpsNs == 0L || nowNs - lastGpsNs > GPS_FRESH_NS) return;
         double gpsDelta = gpsSpeedMps - lastGpsSpeedMps;
         if (Math.abs(gpsDelta) < 0.35 || Math.abs(accelAfterSign) < 0.35) return;
         // If GPS says speed is rising while accel says braking, or the opposite, flip once.
@@ -351,23 +393,192 @@ public class PhoneSensorDataProvider implements SensorEventListener, LocationLis
     private void integrateAcceleration(double accelMps2, double dt, long nowNs) {
         if (mode == Mode.GPS_ONLY) return;
 
-        speedMps += accelMps2 * dt;
-        speedMps = clamp(speedMps, 0.0, 72.222); // 260km/h
+        updateMotionStateBeforeIntegration(accelMps2, dt, nowNs);
 
-        boolean gpsFresh = hasGpsSpeed && nowNs - lastGpsNs < 2_500_000_000L;
-        if (mode == Mode.FUSION && gpsFresh) {
-            // Complementary filter: acceleration responds instantly, GPS slowly pulls it back
-            // to the real absolute speed so long-term drift does not build up.
-            double correctionAlpha = clamp(dt / 1.25, 0.0, 0.080);
-            speedMps += (gpsSpeedMps - speedMps) * correctionAlpha;
-            if (gpsSpeedMps < 0.45 && Math.abs(accelMps2) < 0.12) speedMps *= 0.90;
-        } else if (mode == Mode.ACCEL_ONLY) {
-            // Pure integration inevitably drifts. This very small leakage keeps idle drift from
-            // slowly moving the VVVF playback when the phone is stationary.
-            double leak = Math.exp(-dt * 0.020);
-            speedMps *= leak;
-            if (speedMps < 0.38 && Math.abs(accelMps2) < 0.10) speedMps = 0.0;
+        if (motionState == MotionState.STOP_CONFIRMED && shouldHoldZeroDespiteGpsLag(nowNs)) {
+            speedMps = 0.0;
+            return;
         }
+
+        speedMps += accelMps2 * dt;
+        speedMps = clamp(speedMps, 0.0, MAX_SPEED_MPS);
+        maxSpeedDuringRunMps = Math.max(maxSpeedDuringRunMps, speedMps);
+
+        boolean gpsFresh = hasGpsSpeed && nowNs - lastGpsNs < GPS_FRESH_NS;
+        if (mode == Mode.FUSION && gpsFresh) {
+            if (isStopLikeState() && Math.abs(accelMps2) < CRUISE_ACCEL_MPS2 && gpsSpeedMps > 0.70) {
+                // After an accelerometer-confirmed stop, Android GPS often continues to report
+                // the old moving speed for a moment. Do not let that delayed value wake the VVVF.
+                if (lastStopConfirmedNs == 0L || nowNs - lastStopConfirmedNs > GPS_DELAY_HOLD_AFTER_STOP_NS) {
+                    double correctionAlpha = clamp(dt / 2.20, 0.0, 0.035);
+                    speedMps += (gpsSpeedMps - speedMps) * correctionAlpha;
+                }
+            } else {
+                // Complementary filter: acceleration responds instantly, GPS slowly pulls it back
+                // to the real absolute speed so long-term drift does not build up.
+                double correctionAlpha = clamp(dt / 1.25, 0.0, 0.080);
+                speedMps += (gpsSpeedMps - speedMps) * correctionAlpha;
+                if (gpsSpeedMps < 0.45 && Math.abs(accelMps2) < 0.12) speedMps *= 0.82;
+            }
+        } else if (mode == Mode.ACCEL_ONLY) {
+            // Pure integration inevitably drifts. This small leakage keeps idle drift from
+            // slowly moving the VVVF playback when the phone is stationary.
+            double leak = Math.exp(-dt * (isStopLikeState() ? 0.65 : 0.020));
+            speedMps *= leak;
+        }
+
+        updateMotionStateAfterIntegration(accelMps2, nowNs);
+    }
+
+    private void updateMotionStateBeforeIntegration(double accelMps2, double dt, long nowNs) {
+        boolean nearZero = Math.abs(accelMps2) < CRUISE_ACCEL_MPS2;
+        if (nearZero) {
+            if (nearZeroSinceNs == 0L) nearZeroSinceNs = nowNs;
+        } else {
+            nearZeroSinceNs = 0L;
+        }
+
+        if (accelMps2 > START_ACCEL_MPS2) {
+            if (motionState == MotionState.STOPPED || motionState == MotionState.STOP_CONFIRMED || motionState == MotionState.STOP_CANDIDATE) {
+                driveImpulseMps = 0.0;
+                brakeImpulseMps = 0.0;
+                speedAtBrakeStartMps = 0.0;
+                maxSpeedDuringRunMps = Math.max(speedMps, gpsSpeedMps);
+            }
+            driveImpulseMps += accelMps2 * dt;
+            brakeStableSinceNs = 0L;
+            setMotionState(MotionState.ACCELERATING, nowNs);
+            return;
+        }
+
+        if (accelMps2 < BRAKE_ACCEL_MPS2) {
+            if (motionState != MotionState.BRAKING) {
+                speedAtBrakeStartMps = Math.max(speedMps, gpsSpeedMps * 0.65);
+                if (speedAtBrakeStartMps < 0.55) speedAtBrakeStartMps = Math.max(maxSpeedDuringRunMps, driveImpulseMps);
+                brakeImpulseMps = 0.0;
+                brakeStableSinceNs = 0L;
+                setMotionState(MotionState.BRAKING, nowNs);
+            }
+            brakeImpulseMps += (-accelMps2) * dt;
+            return;
+        }
+
+        if (nearZero) {
+            if (motionState == MotionState.BRAKING) {
+                if (brakeStableSinceNs == 0L) brakeStableSinceNs = nowNs;
+                if (nowNs - brakeStableSinceNs >= STOP_STABLE_MIN_NS && brakingLooksLikeStop(nowNs)) {
+                    setMotionState(MotionState.STOP_CANDIDATE, nowNs);
+                }
+            } else if (motionState == MotionState.ACCELERATING || motionState == MotionState.CRUISING) {
+                setMotionState(MotionState.CRUISING, nowNs);
+            } else if (motionState == MotionState.STOPPED && speedMps > 0.55) {
+                setMotionState(MotionState.CRUISING, nowNs);
+            }
+        } else if (motionState == MotionState.ACCELERATING || motionState == MotionState.BRAKING) {
+            // Small non-zero vibration while the car is rolling: keep the current state.
+        } else if (speedMps > 0.75) {
+            setMotionState(MotionState.CRUISING, nowNs);
+        }
+    }
+
+    private void updateMotionStateAfterIntegration(double accelMps2, long nowNs) {
+        if (mode == Mode.GPS_ONLY) return;
+
+        boolean nearZeroStable = nearZeroSinceNs != 0L && nowNs - nearZeroSinceNs >= STOP_CONFIRM_MIN_NS;
+        boolean gpsFresh = hasGpsSpeed && nowNs - lastGpsNs < GPS_FRESH_NS;
+        boolean gpsSaysStopped = gpsFresh && gpsSpeedMps < 0.75;
+        boolean gpsSaysMovingFast = gpsFresh && gpsSpeedMps > 4.50;
+
+        if (motionState == MotionState.STOP_CANDIDATE) {
+            int score = 0;
+            if (nearZeroStable) score += 2;
+            if (speedMps < 1.25) score += 2;
+            if (brakeImpulseMps >= Math.max(0.70, speedAtBrakeStartMps * 0.72)) score += 2;
+            if (gpsSaysStopped) score += 2;
+            if (gpsSaysMovingFast && brakeImpulseMps < Math.max(1.20, speedAtBrakeStartMps * 0.92)) score -= 2;
+
+            if (score >= 4) {
+                confirmStop(nowNs, gpsSaysStopped ? "GPS低速确认" : "刹车后平稳确认");
+                return;
+            }
+
+            if (accelMps2 < STRONG_BRAKE_MPS2) {
+                setMotionState(MotionState.BRAKING, nowNs);
+                return;
+            }
+            if (accelMps2 > START_ACCEL_MPS2) {
+                setMotionState(MotionState.ACCELERATING, nowNs);
+                return;
+            }
+        }
+
+        if ((motionState == MotionState.STOPPED || motionState == MotionState.STOP_CONFIRMED)
+                && Math.abs(accelMps2) < CRUISE_ACCEL_MPS2 && speedMps < 0.38) {
+            speedMps = 0.0;
+        }
+
+        if (speedMps > 2.0 && motionState == MotionState.STOP_CONFIRMED && accelMps2 > START_ACCEL_MPS2) {
+            setMotionState(MotionState.ACCELERATING, nowNs);
+        }
+    }
+
+    private boolean brakingLooksLikeStop(long nowNs) {
+        boolean gpsFresh = hasGpsSpeed && nowNs - lastGpsNs < GPS_FRESH_NS;
+        boolean gpsLow = gpsFresh && gpsSpeedMps < 1.25;
+        double effectiveBrakeStart = Math.max(speedAtBrakeStartMps, 0.60);
+        boolean brakeEnough = brakeImpulseMps >= Math.max(0.62, effectiveBrakeStart * 0.56);
+        boolean localSpeedLow = speedMps < Math.max(1.90, effectiveBrakeStart * 0.36);
+        boolean strongBrakeToLow = brakeImpulseMps >= Math.max(1.25, effectiveBrakeStart * 0.75) && speedMps < 3.20;
+        return gpsLow || (brakeEnough && localSpeedLow) || strongBrakeToLow;
+    }
+
+    private void confirmStop(long nowNs, String reason) {
+        speedMps = 0.0;
+        brakeStableSinceNs = nowNs;
+        nearZeroSinceNs = nowNs;
+        lastStopConfirmedNs = nowNs;
+        setMotionState(MotionState.STOP_CONFIRMED, nowNs);
+        setStatus("停车确认: " + reason);
+    }
+
+    private boolean isStopLikeState() {
+        return motionState == MotionState.STOPPED || motionState == MotionState.STOP_CANDIDATE || motionState == MotionState.STOP_CONFIRMED;
+    }
+
+    private boolean shouldHoldZeroDespiteGpsLag(long nowNs) {
+        if (motionState != MotionState.STOP_CONFIRMED) return false;
+        if (Math.abs(lastLongitudinalAccelMps2) > START_ACCEL_MPS2) return false;
+        if (!hasGpsSpeed || lastGpsNs == 0L) return true;
+        if (gpsSpeedMps < 0.85) return true;
+        return lastStopConfirmedNs != 0L && nowNs - lastStopConfirmedNs < GPS_DELAY_HOLD_AFTER_STOP_NS;
+    }
+
+    private void setMotionState(MotionState newState, long nowNs) {
+        if (newState == null) newState = MotionState.STOPPED;
+        if (motionState == newState) return;
+        motionState = newState;
+        motionStateSinceNs = nowNs;
+        if (newState == MotionState.CRUISING) {
+            brakeStableSinceNs = 0L;
+        } else if (newState == MotionState.STOPPED || newState == MotionState.STOP_CONFIRMED) {
+            maxSpeedDuringRunMps = 0.0;
+            driveImpulseMps = 0.0;
+            brakeImpulseMps = 0.0;
+            speedAtBrakeStartMps = 0.0;
+        }
+    }
+
+    private void resetMotionState(long nowNs, MotionState initialState) {
+        motionState = initialState == null ? MotionState.STOPPED : initialState;
+        motionStateSinceNs = nowNs;
+        nearZeroSinceNs = 0L;
+        brakeStableSinceNs = 0L;
+        lastStopConfirmedNs = motionState == MotionState.STOP_CONFIRMED || motionState == MotionState.STOPPED ? nowNs : 0L;
+        driveImpulseMps = 0.0;
+        brakeImpulseMps = 0.0;
+        speedAtBrakeStartMps = 0.0;
+        maxSpeedDuringRunMps = Math.max(speedMps, gpsSpeedMps);
+        lastLongitudinalAccelMps2 = 0.0;
     }
 
     private void reportIfNeeded(long nowNs, float accelMps2, boolean force) {
@@ -386,22 +597,24 @@ public class PhoneSensorDataProvider implements SensorEventListener, LocationLis
                 src = "PHONE_GPS";
                 break;
             case FUSION:
-                alpha = 0.42;
-                tau = 0.22;
-                src = "PHONE_GPS+ACCEL";
+                alpha = isStopLikeState() ? 0.24 : 0.42;
+                tau = isStopLikeState() ? 0.36 : 0.22;
+                src = "PHONE_GPS+ACCEL_STOP_DETECT";
                 break;
             case ACCEL_ONLY:
             default:
-                alpha = 0.36;
-                tau = 0.18;
-                src = "PHONE_ACCEL";
+                alpha = isStopLikeState() ? 0.22 : 0.36;
+                tau = isStopLikeState() ? 0.34 : 0.18;
+                src = "PHONE_ACCEL_STOP_DETECT";
                 break;
         }
-        if (force) alpha = 0.70;
+        if (force) alpha = Math.max(alpha, 0.52);
         lastReportedSpeedKmh += (outKmh - lastReportedSpeedKmh) * alpha;
+        if (lastReportedSpeedKmh < 0.16 && outKmh <= 0.02) lastReportedSpeedKmh = 0.0;
         sampleCount++;
-        String raw = String.format(Locale.US, "#%d mode=%s speed=%.1f gps=%.1f accel=%.2f %s",
-                sampleCount, mode.name(), lastReportedSpeedKmh, gpsSpeedMps * 3.6, accelMps2, getStatusText());
+        String raw = String.format(Locale.US, "#%d mode=%s state=%s speed=%.1f gps=%.1f accel=%.2f brake=%.2f start=%.2f %s",
+                sampleCount, mode.name(), motionState.name(), lastReportedSpeedKmh, gpsSpeedMps * 3.6, accelMps2,
+                brakeImpulseMps, speedAtBrakeStartMps, getStatusText());
         if (listener != null) {
             listener.onPhoneSensorData(new PhoneSensorSnapshot(true, (float) lastReportedSpeedKmh, accelMps2,
                     System.currentTimeMillis(), src, tau, raw));
@@ -424,18 +637,48 @@ public class PhoneSensorDataProvider implements SensorEventListener, LocationLis
             newGpsMps = gpsSpeedMps;
         }
         if (Double.isNaN(newGpsMps) || Double.isInfinite(newGpsMps)) return;
-        newGpsMps = clamp(newGpsMps, 0.0, 72.222);
+        newGpsMps = clamp(newGpsMps, 0.0, MAX_SPEED_MPS);
         lastGpsSpeedMps = gpsSpeedMps;
         gpsSpeedMps = newGpsMps;
         lastGpsNs = nowNs;
         hasGpsSpeed = true;
 
+        if (gpsSpeedMps > 1.20) {
+            if (gpsMovingSinceNs == 0L) gpsMovingSinceNs = nowNs;
+        } else {
+            gpsMovingSinceNs = 0L;
+        }
+
         if (mode == Mode.GPS_ONLY) {
             speedMps = gpsSpeedMps;
+            if (gpsSpeedMps < 0.35) {
+                speedMps = 0.0;
+                setMotionState(MotionState.STOPPED, nowNs);
+            } else {
+                setMotionState(MotionState.CRUISING, nowNs);
+            }
             reportIfNeeded(nowNs, 0f, true);
         } else if (mode == Mode.FUSION) {
-            if (speedMps <= 0.01) speedMps = gpsSpeedMps;
-            else speedMps = speedMps * 0.78 + gpsSpeedMps * 0.22;
+            if (motionState == MotionState.STOP_CONFIRMED && Math.abs(lastLongitudinalAccelMps2) < CRUISE_ACCEL_MPS2) {
+                if (gpsSpeedMps < 0.85) {
+                    speedMps = 0.0;
+                } else if (lastStopConfirmedNs != 0L && nowNs - lastStopConfirmedNs < GPS_DELAY_HOLD_AFTER_STOP_NS) {
+                    // Ignore delayed GPS speed shortly after an accelerometer stop confirmation.
+                } else if (gpsMovingSinceNs != 0L && nowNs - gpsMovingSinceNs > 2_000_000_000L) {
+                    // If GPS keeps saying we are moving for long enough, accept that the previous
+                    // accelerometer stop inference was too aggressive.
+                    speedMps = Math.max(speedMps, gpsSpeedMps * 0.35);
+                    setMotionState(MotionState.CRUISING, nowNs);
+                }
+            } else {
+                if (speedMps <= 0.01) speedMps = gpsSpeedMps;
+                else speedMps = speedMps * 0.82 + gpsSpeedMps * 0.18;
+                if (gpsSpeedMps < 0.65 && Math.abs(lastLongitudinalAccelMps2) < CRUISE_ACCEL_MPS2) {
+                    if (motionState == MotionState.BRAKING || motionState == MotionState.STOP_CANDIDATE) {
+                        confirmStop(nowNs, "GPS低速辅助");
+                    }
+                }
+            }
             reportIfNeeded(nowNs, 0f, true);
         }
     }

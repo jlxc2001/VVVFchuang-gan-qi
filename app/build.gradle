@@ -23,7 +23,7 @@ android {
         applicationId 'com.jlxc.mikuvvvf'
         minSdk 23
         targetSdk 35
-        versionCode 10
-        versionName '1.0-v10-phone-sensor'
+        versionCode 11
+        versionName '1.0-v11-stop-detect'
     }
 }

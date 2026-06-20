@@ -288,8 +288,8 @@ public class MainActivity extends Activity {
         RadioGroup sourceGroup = new RadioGroup(this);
         sourceGroup.setOrientation(RadioGroup.VERTICAL);
         sourceGroup.setPadding(0, 0, 0, dp(2));
-        modeFusionButton = addModeRadio(sourceGroup, ID_MODE_FUSION, "GPS + 加速度融合（推荐手机上车用，GPS 定绝对速度，加速度补响应）");
-        modeAccelButton = addModeRadio(sourceGroup, ID_MODE_ACCEL, "仅加速度估算（无 GPS 也能响，但会慢慢漂移，建议先校准）");
+        modeFusionButton = addModeRadio(sourceGroup, ID_MODE_FUSION, "GPS + 加速度融合（推荐，带刹停检测；GPS 慢校正，加速度负责响应）");
+        modeAccelButton = addModeRadio(sourceGroup, ID_MODE_ACCEL, "仅加速度估算（带刹停检测；无 GPS 也能响，但长期仍可能漂移）");
         modeGpsButton = addModeRadio(sourceGroup, ID_MODE_GPS, "仅 GPS 车速（最稳，但速度变化会比实车慢一点）");
         modeHookButton = addModeRadio(sourceGroup, ID_MODE_HOOK, "MainApp Hook 原车车速（车机专用，最低 500ms 轮询）");
         modeManualButton = addModeRadio(sourceGroup, ID_MODE_MANUAL, "手动 / UDP / ADB 调试");
@@ -297,7 +297,7 @@ public class MainActivity extends Activity {
         root.addView(sourceGroup, matchWrap());
         sourceGroup.setOnCheckedChangeListener((group, checkedId) -> sendInputMode(modeFromId(checkedId)));
 
-        TextView sourceHint = smallHint("手机模式会把传感器速度喂给原来的音频平滑层；VVVF 采样窗口连续滑动算法没有删。加速度模式依赖手机固定安装，第一次加速后会自动锁定前进轴向。方向反了就点下面的反转。");
+        TextView sourceHint = smallHint("手机模式会把传感器速度喂给原来的音频平滑层；VVVF 采样窗口连续滑动算法没有删。V11 新增刹停检测：加速→巡航→刹车→平稳后，会把目标速度平滑拉到 0。手机必须固定安装，第一次加速后会自动锁定前进轴向。方向反了就点下面的反转。");
         root.addView(sourceHint, matchWrap());
 
         LinearLayout sensorButtons = new LinearLayout(this);
@@ -620,7 +620,7 @@ public class MainActivity extends Activity {
                 + "  adb shell am broadcast -a com.jlxc.mikuvvvf.SET_SPEED --ef speed 45\n"
                 + "  adb shell am broadcast -a com.jlxc.mikuvvvf.SET_STYLE --es style SAMPLE_VVVF_0_140\n"
                 + "  adb shell am broadcast -a com.jlxc.mikuvvvf.STOP\n\n"
-                + "提示：GPS 模式需要定位权限；纯加速度模式没有绝对速度，会有漂移，适合短时间测试。主界面无按钮，设置入口：长按屏幕。";
+                + "提示：GPS 模式需要定位权限；融合模式推荐实车使用；纯加速度模式已加入刹停检测，但没有绝对速度锚点，长时间仍可能漂移。主界面无按钮，设置入口：长按屏幕。";
         settingsInfoText.setText(text);
     }
 
