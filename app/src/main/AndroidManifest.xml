@@ -1,0 +1,49 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <queries>
+        <package android:name="com.ts.MainUI" />
+        <intent><action android:name="com.ts.can.carinfo.CarInfoService" /></intent>
+        <intent><action android:name="com.ts.tsspeechlib.car.TsCarService" /></intent>
+    </queries>
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <application
+        android:allowBackup="true"
+        android:icon="@drawable/ic_stat_vvvf"
+        android:label="@string/app_name"
+        android:theme="@style/AppTheme"
+        android:usesCleartextTraffic="true">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name=".VvvfSoundService"
+            android:exported="false"
+            android:foregroundServiceType="mediaPlayback" />
+
+        <receiver
+            android:name=".SpeedCommandReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.jlxc.mikuvvvf.SET_SPEED" />
+                <action android:name="com.jlxc.mikuvvvf.SET_STYLE" />
+                <action android:name="com.jlxc.mikuvvvf.SET_HOOK" />
+                <action android:name="com.jlxc.mikuvvvf.SET_MODE" />
+                <action android:name="com.jlxc.mikuvvvf.RESET_SENSOR" />
+                <action android:name="com.jlxc.mikuvvvf.TOGGLE_ACCEL" />
+                <action android:name="com.jlxc.mikuvvvf.STOP" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>

@@ -1,0 +1,29 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.jlxc.mikuvvvf'
+    compileSdk 35
+
+    buildFeatures {
+        aidl true
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    aaptOptions {
+        noCompress 'wav'
+    }
+
+    defaultConfig {
+        applicationId 'com.jlxc.mikuvvvf'
+        minSdk 23
+        targetSdk 35
+        versionCode 10
+        versionName '1.0-v10-phone-sensor'
+    }
+}
